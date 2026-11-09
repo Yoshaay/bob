@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Send a Claude Code status to Bob over USB serial.
 
-Used as a Claude Code hook:  bob_notify.py <working|tool|done|attention|idle>
+Used as a Claude Code hook:  bob_notify.py <working|tool|done|attention|end|idle>
+Each event carries the Claude session id ("@abcd1234"), so Bob can track several sessions.
 Every call is logged to host/bob.log (last ~500 lines kept).
 Reads the hook JSON from stdin (for the project name). Never fails or blocks
 Claude: any problem (device unplugged, port busy) is silently ignored.
@@ -13,7 +14,7 @@ import os
 import signal
 import sys
 
-VALID = {"working", "tool", "done", "attention", "idle"}
+VALID = {"working", "tool", "done", "attention", "end", "idle"}
 LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bob.log")
 
 
@@ -44,6 +45,7 @@ def main() -> None:
     except Exception:
         pass
     event = data.get("hook_event_name", "?") if isinstance(data, dict) else "?"
+    sid = "".join(c for c in str(data.get("session_id", "")) if c.isalnum())[:8] if isinstance(data, dict) else ""
     label = "".join(c for c in label if 32 <= ord(c) < 127)[:34]
 
     if os.path.exists(os.path.join(os.path.dirname(LOG), ".flashing")):
@@ -57,8 +59,9 @@ def main() -> None:
 
     fd = os.open(port, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
     try:
-        os.write(fd, f"{state} {label}\n".encode())
-        log(f"{event} -> {state} {label} via {port}")
+        line = f"{state} @{sid} {label}" if sid and state != "idle" else f"{state} {label}"
+        os.write(fd, (line.strip() + "\n").encode())
+        log(f"{event} -> {line} via {port}")
     finally:
         os.close(fd)
 

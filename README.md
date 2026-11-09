@@ -11,7 +11,13 @@ Ein lebendiges Gesicht, das auf Claude Code reagiert.
 | done | Claude ist fertig | weiß, fröhliche ^^-Augen, hüpft ab und zu, bis du tippst |
 | sleep | 3 min nichts los | Augen zu, gedimmt, Zzz, nach 20 min Display aus |
 
-Tippen aufs Display: bestätigt „fertig“ / „braucht dich“ oder weckt Bob auf.
+Tippen aufs Display: bestätigt „fertig“ oder weckt Bob auf.
+Lange drücken (~1 s): startet den **Fokus-Timer** (25 min, dann 5 min Pause) bzw. stoppt ihn.
+Oben läuft dann ein dünner Balken; kurz tippen zeigt die Restzeit.
+
+**Mehrere Claude-Sessions:** jede Session meldet sich mit ihrer ID. Bob zeigt die wichtigste Stimmung
+(braucht dich > arbeitet > fertig). Ab zwei Sessions zeigen Punkte unter dem Mund den Stand jeder Session
+(orange = arbeitet, gelb = braucht dich, weiß = fertig).
 
 ## Ordner
 - `firmware/` – PlatformIO-Projekt (Arduino, GFX Library for Arduino)
@@ -21,7 +27,7 @@ Tippen aufs Display: bestätigt „fertig“ / „braucht dich“ oder weckt Bob
 ## Befehle
 ```sh
 .venv/bin/pio run -d firmware -t upload          # bauen + flashen
-.venv/bin/pio device monitor -b 115200            # seriell: ping, demo, stats, hello, working, tool, done, attention, idle, sleep, bright 0-255
+.venv/bin/pio device monitor -b 115200            # seriell: ping, demo, stats, dbg, sessions, focus [min|stop], hello, working, tool, done, attention, end, idle, sleep, bright 0-255
 ```
 
 ## Original wiederherstellen
@@ -30,8 +36,8 @@ Tippen aufs Display: bestätigt „fertig“ / „braucht dich“ oder weckt Bob
 ```
 
 ## Hooks
-In `~/.claude/settings.json` (Backup: `~/.claude/settings.json.bak-taby`): UserPromptSubmit/PostToolUse → working,
-Notification(permission_prompt) → attention, Stop → done.
+In `~/.claude/settings.json` (Backup: `~/.claude/settings.json.bak-taby`): UserPromptSubmit → working, PostToolUse → tool,
+Notification(permission_prompt) → attention, Stop → done, SessionEnd → end (jeweils mit `@<session-id>`).
 
 ## Schrift
 `firmware/src/font_bob.h` wird aus Nunito (SIL OFL, `tools/fonts/`) erzeugt:

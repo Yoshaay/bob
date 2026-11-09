@@ -2,15 +2,19 @@
 // Shows a living face and reacts to Claude Code (via hooks over USB serial).
 //
 // Serial protocol (USB CDC, one command per line):
+//   Claude events take an optional session: "<event> @<session-id> [label]"
 //   working [label]    new prompt, Claude is busy -> focused orange eyes, "reading"
 //   tool [label]       a tool finished (keep-alive; ignored right after "done")
 //   done [label]       task finished         -> happy green eyes, stays until tapped
 //   attention [label]  Claude needs you      -> big amber eyes, wiggle
+//   end                session ended
 //   idle | sleep | wake | hello
 //   music play [artist - title] | music stop   (from host/bob_music.py)
 //   bright <0-255>     display brightness
 //   demo               cycle through all moods
 //   stats              frame timing
+//   focus [min] | focus stop        focus timer (also: long press on the display)
+//   sessions           list tracked Claude sessions
 //   ping               -> "bob ok <version>"
 
 #include <Arduino.h>
@@ -18,7 +22,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.8.0"
+#define BOB_VERSION "0.9.0"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -326,7 +330,21 @@ static float musicAlpha = 0, musicScroll = 0;
 static uint32_t musicLast = 0;
 static const uint32_t MUSIC_TIMEOUT_MS = 90UL * 1000;  // watcher gone -> stop
 
-static Mood mood = IDLE, moodAfterLove = IDLE;
+static Mood mood = IDLE;
+
+// Claude Code sessions (each hook event carries "@<session id>")
+enum SState : uint8_t { S_NONE, S_WORKING, S_ATTENTION, S_DONE };
+struct Session { String id; SState st = S_NONE; uint32_t updated = 0, doneAt = 0; };
+static const int MAX_SESSIONS = 6;
+static Session sessions[MAX_SESSIONS];
+static uint32_t cheerUntil = 0;  // short happy hop (a session finished while others still work)
+
+// focus timer (long press)
+enum FocusPhase { F_NONE, F_FOCUS, F_BREAK };
+static FocusPhase focusPhase = F_NONE;
+static uint32_t focusStart = 0, focusDurMs = 25UL * 60 * 1000, breakDurMs = 5UL * 60 * 1000;
+static uint32_t showTimeUntil = 0, alertUntil = 0;
+static float focusAlpha = 0, timeAlpha = 0;
 static uint32_t moodSince = 0, lastActivity = 0;
 static String label = "";
 
@@ -398,6 +416,8 @@ static void setMood(Mood m, const String &lbl = "") {
 }
 
 // ---------- touch ----------
+static void startFocus(uint32_t minutes);
+static void stopFocus();
 static bool touchOk = false;
 static bool readTouch() {
   if (!touchOk) return false;
@@ -411,9 +431,116 @@ static bool readTouch() {
 
 static void onTap() {
   lastActivity = millis();
+  if (focusPhase != F_NONE) showTimeUntil = millis() + 3000;
   if (!screenOn || mood == SLEEP) { setMood(IDLE); startBlink(true); return; }
-  moodAfterLove = mood == WORKING ? WORKING : IDLE;
+  for (auto &se : sessions) if (se.st == S_DONE) se.st = S_NONE;  // tap = "seen"
   setMood(LOVE);
+}
+static void onLongPress() {
+  lastActivity = millis();
+  if (!screenOn || mood == SLEEP) setMood(IDLE);
+  if (focusPhase == F_NONE) startFocus(25); else stopFocus();
+}
+
+// ---------- sessions ----------
+static Session *findSession(const String &id, bool create) {
+  for (auto &se : sessions) if (se.st != S_NONE && se.id == id) return &se;
+  if (!create) return nullptr;
+  Session *slot = nullptr;
+  for (auto &se : sessions) if (se.st == S_NONE) { slot = &se; break; }
+  if (!slot) {  // full: reuse the oldest
+    slot = &sessions[0];
+    for (auto &se : sessions) if (se.updated < slot->updated) slot = &se;
+  }
+  slot->id = id; slot->st = S_NONE; slot->updated = millis(); slot->doneAt = 0;
+  return slot;
+}
+static int sessionCount() { int n = 0; for (auto &se : sessions) if (se.st != S_NONE) n++; return n; }
+
+// derive Bob's mood from all sessions: attention > working > done > idle
+static void applySessions(bool sessionJustFinished) {
+  bool att = false, work = false, done = false;
+  for (auto &se : sessions) {
+    att |= se.st == S_ATTENTION; work |= se.st == S_WORKING; done |= se.st == S_DONE;
+  }
+  if (mood == LOVE && !att) return;  // let the tap reaction finish first
+  if (att) { if (mood != ATTENTION) setMood(ATTENTION, label); }
+  else if (work) {
+    if (mood != WORKING) setMood(WORKING, label);
+    if (sessionJustFinished) cheerUntil = millis() + 1600;
+  }
+  else if (done) { if (mood != DONE && mood != DONE_WAIT) setMood(DONE, label); }
+  else if (mood == WORKING || mood == ATTENTION || mood == DONE || mood == DONE_WAIT || mood == LOVE) setMood(IDLE);
+}
+
+static void expireSessions(uint32_t now) {
+  bool changed = false;
+  for (auto &se : sessions) {
+    if (se.st == S_NONE) continue;
+    uint32_t age = now - se.updated;
+    if ((se.st == S_WORKING && age > WORKING_TIMEOUT_MS) || (se.st == S_ATTENTION && age > 30UL * 60 * 1000) ||
+        (se.st == S_DONE && age > 3UL * 3600 * 1000)) { se.st = S_NONE; changed = true; }
+  }
+  if (changed) applySessions(false);
+}
+
+static void sessionEvent(const String &cmd, const String &sid) {
+  uint32_t now = millis();
+  lastActivity = now;
+  if (cmd == "end") {
+    Session *se = findSession(sid, false);
+    if (se) se->st = S_NONE;
+    applySessions(false);
+    return;
+  }
+  Session *se = findSession(sid, true);
+  SState before = se->st;
+  if (cmd == "working") se->st = S_WORKING;
+  else if (cmd == "tool") {
+    // async hooks can arrive after "done": ignore tool events shortly after it
+    if (before == S_DONE && now - se->doneAt < 8000) return;
+    se->st = S_WORKING;
+  }
+  else if (cmd == "attention") se->st = S_ATTENTION;
+  else if (cmd == "done") { se->st = S_DONE; se->doneAt = now; }
+  se->updated = now;
+  if (se->st == before && before == S_WORKING) return;  // keep-alive only
+  applySessions(se->st == S_DONE && before != S_DONE);
+}
+
+// ---------- focus timer ----------
+static void startFocus(uint32_t minutes) {
+  focusDurMs = minutes * 60UL * 1000;
+  focusPhase = F_FOCUS; focusStart = millis();
+  showTimeUntil = millis() + 2500;
+  cheerUntil = millis() + 900;
+  Serial.printf("bob focus start %u\n", (unsigned)minutes);
+}
+static void stopFocus() {
+  focusPhase = F_NONE; startBlink(true);
+  Serial.println("bob focus stop");
+}
+static void updateFocus(uint32_t now) {
+  if (focusPhase == F_NONE) return;
+  lastActivity = now;  // stay awake while a timer runs
+  uint32_t el = now - focusStart;
+  if (focusPhase == F_FOCUS && el >= focusDurMs) {
+    focusPhase = F_BREAK; focusStart = now;
+    alertUntil = now + 4000; cheerUntil = now + 2500;  // well done -> break
+    if (mood == SLEEP || !screenOn) setMood(IDLE);
+    Serial.println("bob focus break");
+  } else if (focusPhase == F_BREAK && el >= breakDurMs) {
+    focusPhase = F_NONE;
+    alertUntil = now + 3000;  // break over: look at you
+    if (mood == SLEEP || !screenOn) setMood(IDLE);
+    gazeX.target = 0; gazeY.target = 0;
+    Serial.println("bob focus over");
+  }
+}
+static uint32_t focusRemainingMs(uint32_t now) {
+  uint32_t total = focusPhase == F_FOCUS ? focusDurMs : breakDurMs;
+  uint32_t el = now - focusStart;
+  return el >= total ? 0 : total - el;
 }
 
 // ---------- behaviour ----------
@@ -427,6 +554,12 @@ static void idleBehaviour(uint32_t now) {
     return;
   }
   if (now > effectUntil) { eyeDiff.target = 0; smile.target = 0; }
+  if (focusPhase == F_FOCUS) {  // calm: mostly looks down at "the work", sometimes at you
+    if (frand(0, 1) < 0.75f) { gazeX.target = frand(-0.35f, 0.35f); gazeY.target = frand(0.25f, 0.5f); }
+    else { gazeX.target = 0; gazeY.target = 0; }
+    nextAction = now + (uint32_t)frand(3000, 7000);
+    return;
+  }
   float r = frand(0, 1);
   if (r < 0.52f) {          // glance somewhere
     gazeX.target = frand(-1, 1); gazeY.target = frand(-0.75f, 0.75f);
@@ -453,10 +586,10 @@ static void updateBehaviour(float dt, uint32_t now) {
 
   if (mood == HELLO && inMood > HELLO_MS) setMood(IDLE);
   if (mood == DONE && inMood > DONE_HAPPY_MS) { String l = label; setMood(DONE_WAIT, l); }
-  if (mood == LOVE && inMood > LOVE_MS) {
-    if (moodAfterLove == WORKING) { String l = label; setMood(WORKING, l); } else setMood(IDLE);
-  }
-  if (mood == WORKING && now - lastActivity > WORKING_TIMEOUT_MS) setMood(IDLE);
+  if (mood == LOVE && inMood > LOVE_MS) applySessions(false);
+  static uint32_t nextStaleCheck = 0;
+  if (now >= nextStaleCheck) { nextStaleCheck = now + 1000; expireSessions(now); }
+  updateFocus(now);
   bool drowsy = mood == IDLE && now - lastActivity > DROWSY_AFTER_MS;
   if (mood == IDLE) applyLook(drowsy ? L_DROWSY : L_IDLE);
   if (mood == IDLE && now - lastActivity > SLEEP_AFTER_MS) setMood(SLEEP);
@@ -514,6 +647,8 @@ static void updateBehaviour(float dt, uint32_t now) {
 
   sH.k = mood == SLEEP ? 6.0f : 90.0f;
   sH.zeta = mood == SLEEP ? 1.0f : 0.85f;
+  focusAlpha = approach(focusAlpha, focusPhase != F_NONE ? 1 : 0, 4, dt);
+  timeAlpha = approach(timeAlpha, focusPhase != F_NONE && now < showTimeUntil ? 1 : 0, 6, dt);
   musicScroll += 30.0f * dt;
   musicAlpha = approach(musicAlpha, musicOn && musicTrack.length() ? 1 : 0, 4, dt);
   for (Spring *s : SHAPE_SPRINGS) s->step(dt);
@@ -545,6 +680,54 @@ static void drawNowPlaying(float t) {
   }
 }
 
+// ---------- session dots + focus bar ----------
+static void drawSessionDots() {
+  if (sessionCount() < 2) return;
+  static const RGB C_WORK = {245, 135, 85}, C_ATT = {255, 185, 45}, C_DONE = {235, 240, 245};
+  int n = sessionCount(), i = 0;
+  float x0 = W / 2 - (n - 1) * 8.0f;
+  for (auto &se : sessions) {
+    if (se.st == S_NONE) continue;
+    const RGB &c = se.st == S_WORKING ? C_WORK : se.st == S_ATTENTION ? C_ATT : C_DONE;
+    drawCircle(x0 + i * 16, H - 44, 4, c, 0.9f);
+    i++;
+  }
+}
+
+static void drawFocus(uint32_t now) {
+  if (focusAlpha < 0.02f) return;
+  const float x0 = 120, x1 = W - 120, y = 16;
+  float frac = 0;
+  if (focusPhase != F_NONE) {
+    uint32_t total = focusPhase == F_FOCUS ? focusDurMs : breakDurMs;
+    frac = 1.0f - focusRemainingMs(now) / (float)total;
+    if (focusPhase == F_BREAK) frac = 1.0f - frac;  // break: bar shrinks
+  }
+  const RGB track = {70, 72, 76}, fill = {200, 203, 208};
+  float hw = (x1 - x0) / 2;
+  // track
+  int bx0 = (int)x0 - 3, bx1 = (int)x1 + 3;
+  drawn.add(bx0, (int)y - 4, bx1, (int)y + 4);
+  for (int x = bx0; x <= bx1; x++)
+    for (int yy = (int)y - 4; yy <= (int)y + 4; yy++) {
+      float px = x + 0.5f, py = yy + 0.5f;
+      float dTrack = sdRoundBox(px - (x0 + hw), py - y, hw, 2.0f, 2.0f);
+      float fx1 = x0 + (x1 - x0) * frac;
+      float fhw = max((fx1 - x0) / 2, 0.0f);
+      float dFill = fhw > 0.5f ? sdRoundBox(px - (x0 + fhw), py - y, fhw, 2.0f, 2.0f) : 99;
+      float aT = clampf(0.5f - dTrack, 0, 1), aF = clampf(0.5f - dFill, 0, 1);
+      if (aT > 0) blendPixel(x, yy, track, aT * focusAlpha * 0.6f);
+      if (aF > 0) blendPixel(x, yy, fill, aF * focusAlpha * 0.85f);
+    }
+  if (timeAlpha > 0.02f && focusPhase != F_NONE) {
+    uint32_t rem = (focusRemainingMs(now) + 999) / 1000;
+    char buf[16];
+    snprintf(buf, sizeof(buf), focusPhase == F_BREAK ? "Pause %u:%02u" : "%u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+    String txt(buf);
+    drawText(FONT_SMALL, txt, (W - textWidth(FONT_SMALL, txt)) / 2, 46, {170, 172, 178}, timeAlpha);
+  }
+}
+
 // ---------- render ----------
 static const float FACE_LIFT = 14;  // face + dots sit a bit higher to leave room for the track line
 static void render(float t, uint32_t now) {
@@ -568,6 +751,12 @@ static void render(float t, uint32_t now) {
     if (ph < 0.45f) offX = sinf(ph * 48.0f) * 9.0f * (1.0f - ph / 0.45f);
   }
   if (mood == SLEEP) offY += 5.0f * sinf(t * 0.9f);
+  float cheer = now < cheerUntil ? 1 : 0;
+  if (cheer > 0) offY -= fabsf(sinf(t * 9.0f)) * 10.0f;
+  if (now < alertUntil) {  // focus timer finished: wiggle to get your attention
+    float ph = fmodf((alertUntil - now) / 1000.0f, 1.0f);
+    if (ph < 0.45f) offX += sinf(ph * 48.0f) * 8.0f * (ph / 0.45f);
+  }
 
 
   float breathe = 1.0f + 0.02f * sinf(t * 1.6f);
@@ -591,7 +780,7 @@ static void render(float t, uint32_t now) {
     e.lidTop = clampf(sLidTop.x, 0, 0.98f);
     e.lidSlant = max(0.0f, sLidSlant.x);
     e.lidBottom = clampf(sLidBottom.x, 0, 0.9f);
-    e.happy = clampf(sHappy.x + smile.x, 0, 1.2f);
+    e.happy = clampf(sHappy.x + smile.x + cheer * 0.25f, 0, 1.2f);
     e.pupil = sPupil.x;
     e.pgx = gx; e.pgy = gy;
     drawEye(e, col);
@@ -600,7 +789,7 @@ static void render(float t, uint32_t now) {
   {
     float mx = W / 2 + gx * 40.0f + offX;
     float my = H / 2 - FACE_LIFT + 78 + gy * 26.0f + offY;
-    float hw = mW.x, curve = mCurve.x;
+    float hw = mW.x + cheer * 6, curve = mCurve.x + cheer * 5;
     if (mood == WORKING) {  // thinking: the mouth shifts a little sideways and wobbles
       mx += sinf(t * 1.3f) * 6;
       curve += sinf(t * 2.1f) * 2.0f;
@@ -615,6 +804,8 @@ static void render(float t, uint32_t now) {
     }
   }
   if (mood == LOVE) drawHeart(cx, cy - 92 + offY * 0.3f, 16, col);
+  drawSessionDots();
+  drawFocus(now);
   drawNowPlaying(t);
 
 
@@ -665,21 +856,29 @@ static void handleCommand(String line) {
                   prevDrawn.x0, prevDrawn.y0, prevDrawn.x1, prevDrawn.y1);
     return;
   }
-  demoRunning = false;
-  if (cmd == "working") {
-    if (mood == WORKING) { lastActivity = millis(); if (arg.length()) label = arg; return; }
-    setMood(WORKING, arg);
-  } else if (cmd == "tool") {
-    // async hooks can arrive after "done": ignore tool events shortly after it
-    uint32_t inMood = millis() - moodSince;
-    if (mood == WORKING) { lastActivity = millis(); if (arg.length()) label = arg; return; }
-    if ((mood == DONE || mood == DONE_WAIT) && inMood < 8000) return;
-    if (mood == LOVE) return;
-    setMood(WORKING, arg);
+  if (cmd == "sessions") {
+    for (auto &se : sessions) if (se.st != S_NONE)
+      Serial.printf("bob session %s state=%d age=%us\n", se.id.c_str(), se.st, (unsigned)((millis() - se.updated) / 1000));
+    Serial.println("bob sessions end");
+    return;
   }
-  else if (cmd == "done") setMood(DONE, arg);
-  else if (cmd == "attention") setMood(ATTENTION, arg);
-  else if (cmd == "idle" || cmd == "wake") setMood(IDLE);
+  demoRunning = false;
+  if (cmd == "working" || cmd == "tool" || cmd == "done" || cmd == "attention" || cmd == "end") {
+    // optional "@<session>" as first token, rest = label
+    String sid = "-";
+    if (arg.startsWith("@")) {
+      int sp2 = arg.indexOf(' ');
+      sid = sp2 < 0 ? arg.substring(1) : arg.substring(1, sp2);
+      arg = sp2 < 0 ? "" : arg.substring(sp2 + 1);
+    }
+    if (arg.length()) label = arg;
+    sessionEvent(cmd, sid);
+  }
+  else if (cmd == "idle" || cmd == "wake") { for (auto &se : sessions) se.st = S_NONE; setMood(IDLE); }
+  else if (cmd == "focus") {
+    if (arg == "stop") stopFocus();
+    else startFocus(arg.toInt() > 0 ? arg.toInt() : 25);
+  }
   else if (cmd == "sleep") setMood(SLEEP);
   else if (cmd == "hello") setMood(HELLO);
   else if (cmd == "music") {
@@ -717,7 +916,7 @@ static void runDemo(uint32_t now) {
     case 2: setMood(WORKING, "mein-projekt"); demoNext = now + 7000; break;
     case 3: setMood(ATTENTION, "mein-projekt"); demoNext = now + 5000; break;
     case 4: setMood(DONE, "mein-projekt"); demoNext = now + 10000; break;
-    case 5: moodAfterLove = IDLE; setMood(LOVE); demoNext = now + 2500; break;
+    case 5: setMood(LOVE); demoNext = now + 2500; break;
     case 6: setMood(SLEEP); demoNext = now + 7000; break;
     default: setMood(IDLE); demoRunning = false; return;
   }
@@ -764,9 +963,11 @@ void loop() {
   pollSerial();
   runDemo(now);
 
+  static bool longFired = false;
   bool touched = readTouch();
-  if (touched && !wasTouched) touchStart = now;
-  if (!touched && wasTouched && now - touchStart < 1500) onTap();
+  if (touched && !wasTouched) { touchStart = now; longFired = false; }
+  if (touched && !longFired && now - touchStart > 900) { longFired = true; onLongPress(); }
+  if (!touched && wasTouched && !longFired) onTap();
   wasTouched = touched;
 
   now = millis();  // commands above may have set timestamps later than the old 'now'
