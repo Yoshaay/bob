@@ -15,6 +15,7 @@
 //   stats              frame timing
 //   focus [min] | focus stop        focus timer (also: long press on the display)
 //   sessions           list tracked Claude sessions
+//   tap | longpress    simulate touch
 //   ping               -> "bob ok <version>"
 
 #include <Arduino.h>
@@ -22,7 +23,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.9.0"
+#define BOB_VERSION "0.9.2"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -586,7 +587,7 @@ static void updateBehaviour(float dt, uint32_t now) {
 
   if (mood == HELLO && inMood > HELLO_MS) setMood(IDLE);
   if (mood == DONE && inMood > DONE_HAPPY_MS) { String l = label; setMood(DONE_WAIT, l); }
-  if (mood == LOVE && inMood > LOVE_MS) applySessions(false);
+  if (mood == LOVE && inMood > LOVE_MS) { setMood(IDLE); applySessions(false); }
   static uint32_t nextStaleCheck = 0;
   if (now >= nextStaleCheck) { nextStaleCheck = now + 1000; expireSessions(now); }
   updateFocus(now);
@@ -667,7 +668,8 @@ static void drawNowPlaying(float t) {
   const int boxX0 = 40, boxX1 = W - 40;  // text area
   int tw = textWidth(FONT_SMALL, musicTrack);
   int avail = boxX1 - boxX0;
-  float a = musicAlpha * 0.9f;
+  float a = musicAlpha * 0.9f * (1 - timeAlpha);
+  if (a < 0.02f) return;
   if (tw <= avail) {
     clipX0 = 0; clipX1 = W - 1;
     drawText(FONT_SMALL, musicTrack, (W - tw) / 2, base, c, a);
@@ -696,7 +698,7 @@ static void drawSessionDots() {
 
 static void drawFocus(uint32_t now) {
   if (focusAlpha < 0.02f) return;
-  const float x0 = 120, x1 = W - 120, y = 16;
+  const float x0 = 140, x1 = W - 140, y = 9;
   float frac = 0;
   if (focusPhase != F_NONE) {
     uint32_t total = focusPhase == F_FOCUS ? focusDurMs : breakDurMs;
@@ -724,7 +726,7 @@ static void drawFocus(uint32_t now) {
     char buf[16];
     snprintf(buf, sizeof(buf), focusPhase == F_BREAK ? "Pause %u:%02u" : "%u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
     String txt(buf);
-    drawText(FONT_SMALL, txt, (W - textWidth(FONT_SMALL, txt)) / 2, 46, {170, 172, 178}, timeAlpha);
+    drawText(FONT_SMALL, txt, (W - textWidth(FONT_SMALL, txt)) / 2, H - 18, {150, 152, 158}, timeAlpha * 0.9f);
   }
 }
 
@@ -761,6 +763,8 @@ static void render(float t, uint32_t now) {
 
   float breathe = 1.0f + 0.02f * sinf(t * 1.6f);
   float gx = clampf(gazeX.x + microX, -1.2f, 1.2f), gy = clampf(gazeY.x + microY, -1.2f, 1.2f);
+  float gyMin = lerpf(-1.2f, -0.3f, focusAlpha);  // timer bar on top: don't look up into it
+  if (gy < gyMin) gy = gyMin;
   float speed = sqrtf(gazeX.v * gazeX.v + gazeY.v * gazeY.v);
   float squash = clampf(speed * 0.045f, 0, 0.22f);  // fast motion squashes the eyes a bit
 
@@ -875,6 +879,8 @@ static void handleCommand(String line) {
     sessionEvent(cmd, sid);
   }
   else if (cmd == "idle" || cmd == "wake") { for (auto &se : sessions) se.st = S_NONE; setMood(IDLE); }
+  else if (cmd == "tap") onTap();
+  else if (cmd == "longpress") onLongPress();
   else if (cmd == "focus") {
     if (arg == "stop") stopFocus();
     else startFocus(arg.toInt() > 0 ? arg.toInt() : 25);
@@ -964,7 +970,9 @@ void loop() {
   runDemo(now);
 
   static bool longFired = false;
-  bool touched = readTouch();
+  static uint32_t lastContact = 0;
+  if (readTouch()) lastContact = now;
+  bool touched = lastContact && now - lastContact < 120;  // controller drops out briefly while held
   if (touched && !wasTouched) { touchStart = now; longFired = false; }
   if (touched && !longFired && now - touchStart > 900) { longFired = true; onLongPress(); }
   if (!touched && wasTouched && !longFired) onTap();
