@@ -18,7 +18,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.6.2"
+#define BOB_VERSION "0.8.0"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -145,8 +145,8 @@ static void drawEye(const EyeShape &e, const RGB &col) {
   float slopeN = 1.0f / sqrtf(1 + slope * slope);
   bool useLid = e.lidTop > 0.001f || e.lidSlant > 0.001f;
   float lidBY = bottom - e.lidBottom * e.h;
-  float R = e.w * 0.9f;
-  float hcy = bottom + R - e.happy * e.h * 0.62f;
+  float R = e.w * 1.15f;
+  float hcy = bottom + R - e.happy * e.h * 0.75f;
 
   uint16_t solid = pack(col.r, col.g, col.b);
   // Per column (= contiguous memory): find the exact inside span analytically, fill it
@@ -192,11 +192,11 @@ static void drawEye(const EyeShape &e, const RGB &col) {
   }
 
   // pupil: a black disc, faded out for happy eyes and very flat (blinking/sleeping) eyes
-  float vis = clampf(1.6f - e.happy * 2.2f, 0, 1) * clampf((hh - 10) / 20, 0, 1);
+  float vis = clampf(2.6f - e.happy * 3.2f, 0, 1) * clampf((hh - 10) / 20, 0, 1);
   if (e.pupil > 0.01f && vis > 0.01f) {
     float pr = e.pupil * min(hw, hh);
     float px = e.cx + e.pgx * (hw - pr - 7) * 0.65f;
-    float py = e.cy + e.pgy * (hh - pr - 7) * 0.65f;
+    float py = e.cy + e.pgy * (hh - pr - 7) * 0.65f - e.happy * hh * 0.35f;
     py = max(py, lidY + pr * 0.4f);  // keep it under a lowered lid
     drawCircle(px, py, pr, {0, 0, 0}, vis);
     drawCircle(px + pr * 0.38f, py - pr * 0.4f, max(pr * 0.24f, 2.0f), col, vis);  // catchlight
@@ -212,6 +212,29 @@ static void drawCircle(float cx, float cy, float rad, const RGB &col, float alph
       float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
       blendPixel(x, y, col, alpha * clampf(rad + 0.5f - sqrtf(dx * dx + dy * dy), 0, 1));
     }
+}
+
+// mouth: a rounded bar bent along a parabola (curve > 0 = smile), opening up into an oval
+static void drawMouth(float mx, float my, float hw, float curve, float open, const RGB &col, float alpha) {
+  const float thick = 3.2f;                 // half thickness of the line
+  float hh = thick + open * 10.0f;          // opening makes it taller
+  float rr = min(hh, hw);
+  float bendMax = fabsf(curve);
+  int x0 = max(0, (int)(mx - hw - 2)), x1 = min(W - 1, (int)(mx + hw + 2));
+  int y0 = max(0, (int)(my - hh - bendMax - 2)), y1 = min(H - 1, (int)(my + hh + bendMax + 2));
+  drawn.add(x0, y0, x1, y1);
+  for (int x = x0; x <= x1; x++) {
+    float dx = x + 0.5f - mx;
+    float u = clampf(dx / hw, -1, 1);
+    float bend = curve * (1 - u * u);       // corners up, middle down for a smile
+    float slope = -2 * curve * u / hw;
+    float norm = 1.0f / sqrtf(1 + slope * slope);
+    for (int y = y0; y <= y1; y++) {
+      float dy = y + 0.5f - (my + bend - curve * 0.5f);
+      float d = sdRoundBox(dx, dy * norm, hw, hh, rr);
+      blendPixel(x, y, col, alpha * clampf(0.5f - d, 0, 1));
+    }
+  }
 }
 
 static void drawHeart(float cx, float cy, float s, const RGB &col) {
@@ -283,15 +306,15 @@ struct Look {
   RGB col;
 };
 static const RGB WHITE = {235, 240, 245};
-static const Look L_IDLE      = {92, 112, 40, 152, 0.00f, 0.00f, 0.00f, 0.12f, WHITE};
+static const Look L_IDLE      = {92, 112, 40, 152, 0.00f, 0.00f, 0.00f, 0, WHITE};
 static const Look L_DROWSY    = {96,  62, 28, 152, 0.00f, 0.00f, 0.00f, 0, {200, 205, 210}};
-static const Look L_WORKING   = {98,  96, 38, 152, 0.00f, 0.00f, 0.00f, 0.20f, {245, 135,  85}};
-static const Look L_DONE      = {104, 106, 36, 158, 0.00f, 0.00f, 0.00f, 1, WHITE};
-static const Look L_DONE_WAIT = {100, 106, 34, 156, 0.00f, 0.00f, 0.00f, 1, WHITE};  // stays happy until tapped
+static const Look L_WORKING   = {98,  96, 38, 152, 0.00f, 0.00f, 0.00f, 0, {245, 135,  85}};
+static const Look L_DONE      = {100, 112, 40, 156, 0.00f, 0.00f, 0.00f, 0.32f, WHITE};
+static const Look L_DONE_WAIT = {96, 112, 40, 154, 0.00f, 0.00f, 0.00f, 0.28f, WHITE};  // stays happy until tapped
 static const Look L_ATTENTION = {108, 126, 44, 160, 0.00f, 0.00f, 0.00f, 0, {255, 185,  45}};
 static const Look L_SLEEP     = {84,   9, 30, 150, 0.00f, 0.00f, 0.00f, 0, {110, 112, 118}};
-static const Look L_LOVE      = {104, 106, 36, 158, 0.00f, 0.00f, 0.00f, 1, WHITE};
-static const Look L_HELLO     = {100, 108, 34, 156, 0.00f, 0.00f, 0.00f, 1, WHITE};
+static const Look L_LOVE      = {100, 112, 40, 156, 0.00f, 0.00f, 0.00f, 0.32f, WHITE};
+static const Look L_HELLO     = {98, 112, 40, 154, 0.00f, 0.00f, 0.00f, 0.25f, WHITE};
 
 enum Mood { IDLE, WORKING, DONE, DONE_WAIT, ATTENTION, SLEEP, LOVE, HELLO };
 static const char *MOOD_NAMES[] = {"idle", "working", "done", "done_wait", "attention", "sleep", "love", "hello"};
@@ -312,7 +335,8 @@ static Spring gazeX, gazeY;
 static Spring eyeDiff;  // + makes the right eye bigger (curious)
 static Spring smile;    // extra smile (idle "smiles at you")
 static Spring sPupil;   // pupil size
-static Spring *SHAPE_SPRINGS[] = {&sW, &sH, &sR, &sGap, &sLidTop, &sLidSlant, &sLidBottom, &sHappy, &eyeDiff, &smile, &sPupil};
+static Spring mW, mCurve, mOpen;  // mouth half-width, smile curve, opening
+static Spring *SHAPE_SPRINGS[] = {&sW, &sH, &sR, &sGap, &sLidTop, &sLidSlant, &sLidBottom, &sHappy, &eyeDiff, &smile, &sPupil, &mW, &mCurve, &mOpen};
 static RGB col = L_IDLE.col, colTarget = L_IDLE.col;
 
 static float blinkOpen = 1;
@@ -355,6 +379,11 @@ static void setMood(Mood m, const String &lbl = "") {
   nextAction = millis() + 300;
   static const float PUPIL[] = {0.42f, 0.36f, 0.42f, 0.42f, 0.28f, 0.42f, 0.5f, 0.42f};  // per Mood
   sPupil.target = PUPIL[m];
+  //                       IDLE  WORK  DONE  WAIT  ATTN  SLEEP LOVE  HELLO
+  static const float MW[] = {16,   12,   24,   20,   8,    8,    22,   22};
+  static const float MC[] = {6,    0,    9,    8,    0,    0,    10,   9};
+  static const float MO[] = {0,    0,    0.4f, 0,    0.9f, 0,    0.45f, 0.3f};
+  mW.target = MW[m]; mCurve.target = MC[m]; mOpen.target = MO[m];
   switch (m) {
     case IDLE: applyLook(L_IDLE); break;
     case WORKING: applyLook(L_WORKING); nextAction = 0; break;
@@ -413,7 +442,7 @@ static void idleBehaviour(uint32_t now) {
     eyeDiff.target = 0.16f * side; effectUntil = now + 1600;
     nextAction = now + 1700;
   } else {                  // look at you and smile
-    smile.target = 0.55f; effectUntil = now + 1800;
+    smile.target = 0.3f; effectUntil = now + 1800;
     gazeX.target = 0; gazeY.target = 0;
     nextAction = now + 2000;
   }
@@ -568,11 +597,16 @@ static void render(float t, uint32_t now) {
     drawEye(e, col);
   }
 
-  if (mood == WORKING) {
-    for (int i = 0; i < 3; i++) {
-      float a = 0.35f + 0.65f * (0.5f + 0.5f * sinf(t * 5.0f - i * 0.9f));
-      drawCircle(W / 2 - 20 + i * 20, H - 52 - FACE_LIFT, 5, col, a);
+  {
+    float mx = W / 2 + gx * 40.0f + offX;
+    float my = H / 2 - FACE_LIFT + 78 + gy * 26.0f + offY;
+    float hw = mW.x, curve = mCurve.x;
+    if (mood == WORKING) {  // thinking: the mouth shifts a little sideways and wobbles
+      mx += sinf(t * 1.3f) * 6;
+      curve += sinf(t * 2.1f) * 2.0f;
     }
+    if (mood == SLEEP) hw += sinf(t * 0.9f) * 1.5f;
+    drawMouth(mx, my, max(hw, 4.0f), curve, clampf(mOpen.x, 0, 1), col, 1);
   }
   if (mood == SLEEP) {
     for (int i = 0; i < 3; i++) {
