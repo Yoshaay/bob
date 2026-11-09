@@ -23,7 +23,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.9.2"
+#define BOB_VERSION "0.9.3"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -318,7 +318,7 @@ static const Look L_DONE      = {100, 112, 40, 156, 0.00f, 0.00f, 0.00f, 0.32f, 
 static const Look L_DONE_WAIT = {96, 112, 40, 154, 0.00f, 0.00f, 0.00f, 0.28f, WHITE};  // stays happy until tapped
 static const Look L_ATTENTION = {108, 126, 44, 160, 0.00f, 0.00f, 0.00f, 0, {255, 185,  45}};
 static const Look L_SLEEP     = {84,   9, 30, 150, 0.00f, 0.00f, 0.00f, 0, {110, 112, 118}};
-static const Look L_LOVE      = {100, 112, 40, 156, 0.00f, 0.00f, 0.00f, 0.32f, WHITE};
+static const Look L_LOVE      = {100, 112, 40, 156, 0.00f, 0.00f, 0.00f, 0.32f, {255, 125, 180}};  // short pink blush on tap
 static const Look L_HELLO     = {98, 112, 40, 154, 0.00f, 0.00f, 0.00f, 0.25f, WHITE};
 
 enum Mood { IDLE, WORKING, DONE, DONE_WAIT, ATTENTION, SLEEP, LOVE, HELLO };
@@ -654,7 +654,7 @@ static void updateBehaviour(float dt, uint32_t now) {
   musicAlpha = approach(musicAlpha, musicOn && musicTrack.length() ? 1 : 0, 4, dt);
   for (Spring *s : SHAPE_SPRINGS) s->step(dt);
   gazeX.step(dt); gazeY.step(dt);
-  float cs = mood == SLEEP ? 1.2f : 5.0f;
+  float cs = mood == SLEEP ? 1.2f : (mood == LOVE ? 10.0f : 5.0f);  // blush quickly
   col.r = approach(col.r, colTarget.r, cs, dt);
   col.g = approach(col.g, colTarget.g, cs, dt);
   col.b = approach(col.b, colTarget.b, cs, dt);
