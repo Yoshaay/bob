@@ -18,7 +18,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.6.0"
+#define BOB_VERSION "0.6.1"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -192,13 +192,14 @@ static void drawEye(const EyeShape &e, const RGB &col) {
   }
 
   // pupil: a black disc, faded out for happy eyes and very flat (blinking/sleeping) eyes
-  float vis = clampf(1 - e.happy * 1.6f, 0, 1) * clampf((hh - 10) / 20, 0, 1);
+  float vis = clampf(1.6f - e.happy * 2.2f, 0, 1) * clampf((hh - 10) / 20, 0, 1);
   if (e.pupil > 0.01f && vis > 0.01f) {
     float pr = e.pupil * min(hw, hh);
     float px = e.cx + e.pgx * (hw - pr - 7) * 0.65f;
     float py = e.cy + e.pgy * (hh - pr - 7) * 0.65f;
     py = max(py, lidY + pr * 0.4f);  // keep it under a lowered lid
     drawCircle(px, py, pr, {0, 0, 0}, vis);
+    drawCircle(px + pr * 0.38f, py - pr * 0.4f, max(pr * 0.24f, 2.0f), col, vis);  // catchlight
   }
 }
 
@@ -282,12 +283,12 @@ struct Look {
   RGB col;
 };
 static const RGB WHITE = {235, 240, 245};
-static const Look L_IDLE      = {92, 112, 30, 152, 0.00f, 0.00f, 0.00f, 0, WHITE};
+static const Look L_IDLE      = {92, 112, 40, 152, 0.00f, 0.00f, 0.00f, 0.12f, WHITE};
 static const Look L_DROWSY    = {96,  62, 28, 152, 0.00f, 0.00f, 0.00f, 0, {200, 205, 210}};
-static const Look L_WORKING   = {98,  90, 26, 152, 0.12f, 0.32f, 0.08f, 0, {245, 135,  85}};
+static const Look L_WORKING   = {98,  96, 38, 152, 0.00f, 0.00f, 0.00f, 0.20f, {245, 135,  85}};
 static const Look L_DONE      = {104, 106, 36, 158, 0.00f, 0.00f, 0.00f, 1, WHITE};
 static const Look L_DONE_WAIT = {100, 106, 34, 156, 0.00f, 0.00f, 0.00f, 1, WHITE};  // stays happy until tapped
-static const Look L_ATTENTION = {108, 126, 34, 160, 0.00f, 0.00f, 0.00f, 0, {255, 185,  45}};
+static const Look L_ATTENTION = {108, 126, 44, 160, 0.00f, 0.00f, 0.00f, 0, {255, 185,  45}};
 static const Look L_SLEEP     = {84,   9, 30, 150, 0.00f, 0.00f, 0.00f, 0, {110, 112, 118}};
 static const Look L_LOVE      = {104, 106, 36, 158, 0.00f, 0.00f, 0.00f, 1, WHITE};
 static const Look L_HELLO     = {100, 108, 34, 156, 0.00f, 0.00f, 0.00f, 1, WHITE};
@@ -309,9 +310,9 @@ static String label = "";
 static Spring sW, sH, sR, sGap, sLidTop, sLidSlant, sLidBottom, sHappy;
 static Spring gazeX, gazeY;
 static Spring eyeDiff;  // + makes the right eye bigger (curious)
-static Spring skeptic;  // extra top lid on one eye (sign = which eye)
+static Spring smile;    // extra smile (idle "smiles at you")
 static Spring sPupil;   // pupil size
-static Spring *SHAPE_SPRINGS[] = {&sW, &sH, &sR, &sGap, &sLidTop, &sLidSlant, &sLidBottom, &sHappy, &eyeDiff, &skeptic, &sPupil};
+static Spring *SHAPE_SPRINGS[] = {&sW, &sH, &sR, &sGap, &sLidTop, &sLidSlant, &sLidBottom, &sHappy, &eyeDiff, &smile, &sPupil};
 static RGB col = L_IDLE.col, colTarget = L_IDLE.col;
 
 static float blinkOpen = 1;
@@ -350,7 +351,7 @@ static void setMood(Mood m, const String &lbl = "") {
   screenOn = true;
   dimmed = false;
   panel->setBrightness(brightness);
-  eyeDiff.target = 0; skeptic.target = 0; lookAroundStep = -1;
+  eyeDiff.target = 0; smile.target = 0; lookAroundStep = -1;
   nextAction = millis() + 300;
   static const float PUPIL[] = {0.42f, 0.36f, 0.42f, 0.42f, 0.28f, 0.42f, 0.5f, 0.42f};  // per Mood
   sPupil.target = PUPIL[m];
@@ -396,7 +397,7 @@ static void idleBehaviour(uint32_t now) {
     if (lookAroundStep >= 3) lookAroundStep = -1;
     return;
   }
-  if (now > effectUntil) { eyeDiff.target = 0; skeptic.target = 0; }
+  if (now > effectUntil) { eyeDiff.target = 0; smile.target = 0; }
   float r = frand(0, 1);
   if (r < 0.52f) {          // glance somewhere
     gazeX.target = frand(-1, 1); gazeY.target = frand(-0.75f, 0.75f);
@@ -411,10 +412,10 @@ static void idleBehaviour(uint32_t now) {
     gazeX.target = 0.6f * side; gazeY.target = -0.2f;
     eyeDiff.target = 0.16f * side; effectUntil = now + 1600;
     nextAction = now + 1700;
-  } else {                  // skeptical squint
-    skeptic.target = frand(0, 1) < 0.5f ? -0.35f : 0.35f; effectUntil = now + 1400;
-    gazeX.target = frand(-0.3f, 0.3f); gazeY.target = 0;
-    nextAction = now + 1500;
+  } else {                  // look at you and smile
+    smile.target = 0.55f; effectUntil = now + 1800;
+    gazeX.target = 0; gazeY.target = 0;
+    nextAction = now + 2000;
   }
 }
 
@@ -558,11 +559,10 @@ static void render(float t, uint32_t now) {
     e.cx = cx + (left ? -1 : 1) * sGap.x / 2;
     e.cy = cy + (1 - blinkOpen) * 6;
     e.w = w * scale; e.h = h * scale; e.r = sR.x * scale;
-    float sk = (left ? skeptic.x < 0 : skeptic.x > 0) ? fabsf(skeptic.x) : 0;
-    e.lidTop = clampf(sLidTop.x + sk, 0, 0.98f);
+    e.lidTop = clampf(sLidTop.x, 0, 0.98f);
     e.lidSlant = max(0.0f, sLidSlant.x);
     e.lidBottom = clampf(sLidBottom.x, 0, 0.9f);
-    e.happy = clampf(sHappy.x, 0, 1.2f);
+    e.happy = clampf(sHappy.x + smile.x, 0, 1.2f);
     e.pupil = sPupil.x;
     e.pgx = gx; e.pgy = gy;
     drawEye(e, col);
