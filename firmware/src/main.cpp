@@ -18,7 +18,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.6.1"
+#define BOB_VERSION "0.6.2"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -527,7 +527,7 @@ static void render(float t, uint32_t now) {
   uint32_t inMood = now - moodSince;
   float offX = 0, offY = 0;
   if (mood == DONE || mood == LOVE || mood == HELLO) {
-    float decay = mood == DONE ? expf(-inMood / 2500.0f) : 1.0f;
+    float decay = mood == DONE ? expf(-(float)inMood / 2500.0f) : 1.0f;
     offY -= fabsf(sinf(t * 7.0f)) * 14.0f * decay;
   }
   if (mood == DONE_WAIT) {
@@ -623,6 +623,12 @@ static void handleCommand(String line) {
   if (cmd == "stats") {
     Serial.printf("bob stats frame=%.1fms (%.0f fps) work=%.1fms draw=%.1fms flush=%.1fms lastflush=%upx mood=%s\n",
                   statFrame, 1000.0f / max(statFrame, 1.0f), statWork, statDrawUs / 1000, statFlushUs / 1000, (unsigned)flushPixels, MOOD_NAMES[mood]);
+    return;
+  }
+  if (cmd == "dbg") {
+    Serial.printf("bob dbg w=%.1f h=%.1f r=%.1f gap=%.1f lidT=%.2f happy=%.2f smile=%.2f pupil=%.2f gx=%.2f/%.2f gy=%.2f/%.2f blink=%.2f drawn=%d,%d-%d,%d\n",
+                  sW.x, sH.x, sR.x, sGap.x, sLidTop.x, sHappy.x, smile.x, sPupil.x, gazeX.x, gazeX.v, gazeY.x, gazeY.v, blinkOpen,
+                  prevDrawn.x0, prevDrawn.y0, prevDrawn.x1, prevDrawn.y1);
     return;
   }
   demoRunning = false;
