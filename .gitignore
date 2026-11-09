@@ -1,0 +1,14 @@
+# local Python env + PlatformIO build output
+.venv/
+firmware/.pio/
+__pycache__/
+
+# original vendor firmware dump: proprietary + device-specific data (keep local only!)
+backup/
+
+# runtime files
+host/*.log
+host/*.err
+host/.flashing
+
+.DS_Store
