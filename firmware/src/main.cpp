@@ -13,9 +13,9 @@
 //   bright <0-255>     display brightness
 //   demo               cycle through all moods
 //   stats              frame timing
-//   focus [min] | focus stop        focus timer (also: long press on the display)
+//   focus [min] | focus stop        focus timer (on the display: swipe, then tap "Ja")
 //   sessions           list tracked Claude sessions
-//   tap | longpress    simulate touch
+//   tap [l|r] | swipe  simulate touch
 //   ping               -> "bob ok <version>"
 
 #include <Arduino.h>
@@ -23,7 +23,7 @@
 #include <Arduino_GFX_Library.h>
 #include "font_bob.h"
 
-#define BOB_VERSION "0.9.3"
+#define BOB_VERSION "0.9.5"
 
 #ifndef BOB_LCD_CS
 #define BOB_LCD_CS 9
@@ -340,7 +340,7 @@ static const int MAX_SESSIONS = 6;
 static Session sessions[MAX_SESSIONS];
 static uint32_t cheerUntil = 0;  // short happy hop (a session finished while others still work)
 
-// focus timer (long press)
+// focus timer (swipe + confirm)
 enum FocusPhase { F_NONE, F_FOCUS, F_BREAK };
 static FocusPhase focusPhase = F_NONE;
 static uint32_t focusStart = 0, focusDurMs = 25UL * 60 * 1000, breakDurMs = 5UL * 60 * 1000;
@@ -420,27 +420,65 @@ static void setMood(Mood m, const String &lbl = "") {
 static void startFocus(uint32_t minutes);
 static void stopFocus();
 static bool touchOk = false;
-static bool readTouch() {
+// reads the first touch point, in logical (landscape) coordinates
+static bool readTouch(int &lx, int &ly) {
   if (!touchOk) return false;
   Wire.beginTransmission(TOUCH_ADDR);
   Wire.write(0x02);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(TOUCH_ADDR, (uint8_t)1) != 1) return false;
+  if (Wire.requestFrom(TOUCH_ADDR, (uint8_t)5) != 5) return false;
   uint8_t n = Wire.read() & 0x0F;
-  return n > 0 && n < 3;
+  uint8_t xh = Wire.read(), xl = Wire.read(), yh = Wire.read(), yl = Wire.read();
+  if (n == 0 || n >= 3) return false;
+  int px = ((xh & 0x0F) << 8) | xl, py = ((yh & 0x0F) << 8) | yl;  // physical portrait
+  lx = py; ly = PW - 1 - px;  // same mapping as fbIndex()
+#ifdef BOB_TOUCH_FLIP
+  lx = W - 1 - lx; ly = H - 1 - ly;
+#endif
+  return true;
 }
 
-static void onTap() {
+// focus confirm prompt: swipe opens it, tap left = no, tap right = yes
+enum Confirm { C_NONE, C_START, C_STOP };
+static Confirm confirm = C_NONE;
+static uint32_t confirmUntil = 0;
+// confirmT runs linearly 0..1; the face fades out in the first half, the prompt in over the second
+// (and the other way round when it closes), so the two never sit on top of each other half-transparent
+static float confirmT = 0, confirmAlpha = 0, faceAlpha = 1, confirmPick = 0;  // pick: -1 no / +1 yes flash
+static bool blinkOnReturn = false;               // blink as the face comes back, not while it's hidden
+static Confirm confirmShown = C_NONE;            // keeps the text while fading out
+static const uint32_t CONFIRM_MS = 6000;
+
+static void onSwipe() {
   lastActivity = millis();
+  if (!screenOn || mood == SLEEP) { setMood(IDLE); startBlink(true); }
+  if (confirm != C_NONE) { confirm = C_NONE; blinkOnReturn = true; return; }  // swipe again = cancel
+  confirm = focusPhase == F_NONE ? C_START : C_STOP;
+  confirmShown = confirm; confirmPick = 0;
+  confirmUntil = millis() + CONFIRM_MS;
+  Serial.printf("bob confirm %s\n", confirm == C_START ? "start" : "stop");
+}
+static void answerConfirm(bool yes) {
+  Confirm c = confirm;
+  confirm = C_NONE;
+  confirmPick = yes ? 1 : -1;
+  Serial.printf("bob confirm %s\n", yes ? "yes" : "no");
+  blinkOnReturn = true;
+  if (!yes) return;
+  if (c == C_START) startFocus(25); else stopFocus();
+}
+
+static void onTap(int x = W / 2) {
+  lastActivity = millis();
+  if (confirm != C_NONE) {
+    if (x < W / 2 - 12) answerConfirm(false);
+    else if (x > W / 2 + 12) answerConfirm(true);
+    return;  // a tap right in the middle is ambiguous: ignore it
+  }
   if (focusPhase != F_NONE) showTimeUntil = millis() + 3000;
   if (!screenOn || mood == SLEEP) { setMood(IDLE); startBlink(true); return; }
   for (auto &se : sessions) if (se.st == S_DONE) se.st = S_NONE;  // tap = "seen"
   setMood(LOVE);
-}
-static void onLongPress() {
-  lastActivity = millis();
-  if (!screenOn || mood == SLEEP) setMood(IDLE);
-  if (focusPhase == F_NONE) startFocus(25); else stopFocus();
 }
 
 // ---------- sessions ----------
@@ -649,7 +687,14 @@ static void updateBehaviour(float dt, uint32_t now) {
   sH.k = mood == SLEEP ? 6.0f : 90.0f;
   sH.zeta = mood == SLEEP ? 1.0f : 0.85f;
   focusAlpha = approach(focusAlpha, focusPhase != F_NONE ? 1 : 0, 4, dt);
-  timeAlpha = approach(timeAlpha, focusPhase != F_NONE && now < showTimeUntil ? 1 : 0, 6, dt);
+  timeAlpha = approach(timeAlpha, focusPhase != F_NONE && now < showTimeUntil && confirm == C_NONE ? 1 : 0, 6, dt);
+  if (confirm != C_NONE && now > confirmUntil) { confirm = C_NONE; Serial.println("bob confirm timeout"); }
+  if (confirm != C_NONE) lastActivity = now;
+  if (confirm != C_NONE) confirmT = min(1.0f, confirmT + dt / 0.5f);   // open: 0.5 s
+  else confirmT = max(0.0f, confirmT - dt / 0.45f);                    // close: 0.45 s
+  faceAlpha = 1 - easeInOut(confirmT / 0.5f);
+  confirmAlpha = easeInOut((confirmT - 0.4f) / 0.6f);
+  if (blinkOnReturn && confirm == C_NONE && faceAlpha > 0.05f) { blinkOnReturn = false; startBlink(); }
   musicScroll += 30.0f * dt;
   musicAlpha = approach(musicAlpha, musicOn && musicTrack.length() ? 1 : 0, 4, dt);
   for (Spring *s : SHAPE_SPRINGS) s->step(dt);
@@ -668,7 +713,7 @@ static void drawNowPlaying(float t) {
   const int boxX0 = 40, boxX1 = W - 40;  // text area
   int tw = textWidth(FONT_SMALL, musicTrack);
   int avail = boxX1 - boxX0;
-  float a = musicAlpha * 0.9f * (1 - timeAlpha);
+  float a = musicAlpha * 0.9f * (1 - timeAlpha) * faceAlpha;
   if (a < 0.02f) return;
   if (tw <= avail) {
     clipX0 = 0; clipX1 = W - 1;
@@ -683,7 +728,7 @@ static void drawNowPlaying(float t) {
 }
 
 // ---------- session dots + focus bar ----------
-static void drawSessionDots() {
+static void drawSessionDots(float a) {
   if (sessionCount() < 2) return;
   static const RGB C_WORK = {245, 135, 85}, C_ATT = {255, 185, 45}, C_DONE = {235, 240, 245};
   int n = sessionCount(), i = 0;
@@ -691,7 +736,7 @@ static void drawSessionDots() {
   for (auto &se : sessions) {
     if (se.st == S_NONE) continue;
     const RGB &c = se.st == S_WORKING ? C_WORK : se.st == S_ATTENTION ? C_ATT : C_DONE;
-    drawCircle(x0 + i * 16, H - 44, 4, c, 0.9f);
+    drawCircle(x0 + i * 16, H - 44, 4, c, 0.9f * a);
     i++;
   }
 }
@@ -732,6 +777,48 @@ static void drawFocus(uint32_t now) {
 
 // ---------- render ----------
 static const float FACE_LIFT = 14;  // face + dots sit a bit higher to leave room for the track line
+
+// big rounded button with a centered label (confirm prompt)
+static void drawButton(float cx, float cy, const String &txt, const RGB &bg, const RGB &fg, float a) {
+  const float hw = 96, hh = 50, r = 26;
+  int x0 = max(0, (int)(cx - hw - 1)), x1 = min(W - 1, (int)(cx + hw + 1));
+  int y0 = max(0, (int)(cy - hh - 1)), y1 = min(H - 1, (int)(cy + hh + 1));
+  drawn.add(x0, y0, x1, y1);
+  // the screen behind is black: solid interior gets one packed color, only the rim needs the SDF
+  uint16_t solid = pack(bg.r * a, bg.g * a, bg.b * a);
+  for (int x = x0; x <= x1; x++) {
+    float dx = fabsf(x + 0.5f - cx);
+    for (int y = y0; y <= y1; y++) {
+      float dy = fabsf(y + 0.5f - cy);
+      if ((dx < hw - r && dy < hh - 1) || (dy < hh - r && dx < hw - 1)) { fb[fbIndex(x, y)] = solid; continue; }
+      float d = sdRoundBox(dx, dy, hw, hh, r);
+      blendPixel(x, y, bg, a * clampf(0.5f - d, 0, 1));
+    }
+  }
+  int tw = textWidth(FONT_BIG, txt);
+  drawText(FONT_BIG, txt, (int)(cx - tw / 2.0f), (int)(cy + 14), fg, a);
+}
+
+// the face fades out and the question takes the whole screen
+static void drawConfirm() {
+  if (confirmAlpha <= 0 || confirmShown == C_NONE) return;
+  float a = confirmAlpha;
+  float rise = (1 - a) * 14;  // slides up a little while fading in (a is already eased)
+  const RGB noBg = {58, 60, 66}, light = {245, 247, 250};
+  const RGB yesBg = confirmShown == C_START ? RGB{50, 160, 95} : RGB{205, 85, 65};
+  // the picked answer stays bright while everything fades out
+  float aNo = confirmPick > 0 ? a * a : a, aYes = confirmPick < 0 ? a * a : a;
+  float aText = confirmPick == 0 ? a : a * a;
+  String q = confirmShown == C_START ? "Fokus starten?" : "Fokus beenden?";
+  drawText(FONT_BIG, q, (W - textWidth(FONT_BIG, q)) / 2, (int)(72 + rise), light, aText);
+  if (confirmShown == C_START) {
+    String sub = "25 Minuten";
+    drawText(FONT_SMALL, sub, (W - textWidth(FONT_SMALL, sub)) / 2, (int)(104 + rise), {150, 152, 158}, aText * 0.9f);
+  }
+  drawButton(W / 2 - 114, 190 + rise, "Nein", noBg, light, aNo);
+  drawButton(W / 2 + 114, 190 + rise, "Ja", yesBg, light, aYes);
+}
+
 static void render(float t, uint32_t now) {
   uint32_t t0 = micros();
   prevDrawn.clip();
@@ -761,6 +848,9 @@ static void render(float t, uint32_t now) {
   }
 
 
+  float faceA = faceAlpha;  // the confirm prompt replaces the face
+  RGB fc = {col.r * faceA, col.g * faceA, col.b * faceA};
+  offY += (1 - faceA) * 12;  // sinks away a little while fading
   float breathe = 1.0f + 0.02f * sinf(t * 1.6f);
   float gx = clampf(gazeX.x + microX, -1.2f, 1.2f), gy = clampf(gazeY.x + microY, -1.2f, 1.2f);
   float gyMin = lerpf(-1.2f, -0.3f, focusAlpha);  // timer bar on top: don't look up into it
@@ -773,7 +863,7 @@ static void render(float t, uint32_t now) {
   float persp = gx * 0.07f;  // the eye on the gaze side grows
   float w = sW.x * (1 + squash * 0.5f), h = sH.x * breathe * blinkOpen * (1 - squash);
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 2 && faceA > 0.02f; i++) {
     bool left = i == 0;
     float scale = 1 + (left ? -persp : persp) + (left ? -eyeDiff.x : eyeDiff.x);
     EyeShape e;
@@ -787,10 +877,10 @@ static void render(float t, uint32_t now) {
     e.happy = clampf(sHappy.x + smile.x + cheer * 0.25f, 0, 1.2f);
     e.pupil = sPupil.x;
     e.pgx = gx; e.pgy = gy;
-    drawEye(e, col);
+    drawEye(e, fc);
   }
 
-  {
+  if (faceA > 0.02f) {
     float mx = W / 2 + gx * 40.0f + offX;
     float my = H / 2 - FACE_LIFT + 78 + gy * 26.0f + offY;
     float hw = mW.x + cheer * 6, curve = mCurve.x + cheer * 5;
@@ -799,17 +889,18 @@ static void render(float t, uint32_t now) {
       curve += sinf(t * 2.1f) * 2.0f;
     }
     if (mood == SLEEP) hw += sinf(t * 0.9f) * 1.5f;
-    drawMouth(mx, my, max(hw, 4.0f), curve, clampf(mOpen.x, 0, 1), col, 1);
+    drawMouth(mx, my, max(hw, 4.0f), curve, clampf(mOpen.x, 0, 1), fc, 1);
   }
   if (mood == SLEEP) {
     for (int i = 0; i < 3; i++) {
       float ph = fmodf(t * 0.3f + i / 3.0f, 1.0f);
-      drawText(FONT_SMALL, "z", (int)(cx + sGap.x / 2 + 58 + ph * 36), (int)(cy - 20 - ph * 60), col, sinf(ph * PI) * 0.8f);
+      drawText(FONT_SMALL, "z", (int)(cx + sGap.x / 2 + 58 + ph * 36), (int)(cy - 20 - ph * 60), col, sinf(ph * PI) * 0.8f * faceA);
     }
   }
-  if (mood == LOVE) drawHeart(cx, cy - 92 + offY * 0.3f, 16, col);
-  drawSessionDots();
+  if (mood == LOVE && faceA > 0.02f) drawHeart(cx, cy - 92 + offY * 0.3f, 16, fc);
+  if (faceA > 0.02f) drawSessionDots(faceA);
   drawFocus(now);
+  drawConfirm();
   drawNowPlaying(t);
 
 
@@ -879,8 +970,8 @@ static void handleCommand(String line) {
     sessionEvent(cmd, sid);
   }
   else if (cmd == "idle" || cmd == "wake") { for (auto &se : sessions) se.st = S_NONE; setMood(IDLE); }
-  else if (cmd == "tap") onTap();
-  else if (cmd == "longpress") onLongPress();
+  else if (cmd == "tap") onTap(arg == "l" ? 20 : arg == "r" ? W - 20 : W / 2);  // tap [l|r]
+  else if (cmd == "swipe") onSwipe();
   else if (cmd == "focus") {
     if (arg == "stop") stopFocus();
     else startFocus(arg.toInt() > 0 ? arg.toInt() : 25);
@@ -969,18 +1060,31 @@ void loop() {
   pollSerial();
   runDemo(now);
 
-  static bool longFired = false;
+  // touch: release with little movement = tap, a quick drag = swipe
   static uint32_t lastContact = 0;
-  if (readTouch()) lastContact = now;
+  static int sx = 0, sy = 0, lx = 0, ly = 0;
+  static bool swiped = false;
+  int tx, ty;
+  if (readTouch(tx, ty)) { lastContact = now; lx = tx; ly = ty; }
   bool touched = lastContact && now - lastContact < 120;  // controller drops out briefly while held
-  if (touched && !wasTouched) { touchStart = now; longFired = false; }
-  if (touched && !longFired && now - touchStart > 900) { longFired = true; onLongPress(); }
-  if (!touched && wasTouched && !longFired) onTap();
+  if (touched && !wasTouched) { touchStart = now; sx = lx; sy = ly; swiped = false; }
+  if (touched && !swiped) {
+    int dx = lx - sx, dy = ly - sy;
+    if (dx * dx + dy * dy > 90 * 90 && now - touchStart < 800) { swiped = true; onSwipe(); }
+  }
+  if (!touched && wasTouched) {
+    int dx = lx - sx, dy = ly - sy;
+    Serial.printf("bob touch %d,%d -> %d,%d %ums\n", sx, sy, lx, ly, (unsigned)(now - touchStart));
+    if (!swiped && dx * dx + dy * dy < 40 * 40) onTap(sx);
+  }
   wasTouched = touched;
 
   now = millis();  // commands above may have set timestamps later than the old 'now'
   updateBehaviour(dt, now);
-  if (screenOn) render(now / 1000.0f, now);
+  // a fully shown confirm prompt is a still image: redraw it only now and then
+  static uint32_t lastRender = 0;
+  bool still = confirm != C_NONE && confirmAlpha > 0.995f;
+  if (screenOn && (!still || now - lastRender > 500)) { render(now / 1000.0f, now); lastRender = now; }
 
   uint32_t spent = millis() - now;
   statWork = statWork * 0.95f + spent * 0.05f;

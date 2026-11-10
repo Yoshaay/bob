@@ -27,7 +27,7 @@ Oben läuft dann ein dünner Balken; kurz tippen zeigt die Restzeit.
 ## Befehle
 ```sh
 .venv/bin/pio run -d firmware -t upload          # bauen + flashen
-.venv/bin/pio device monitor -b 115200            # seriell: ping, demo, stats, dbg, sessions, focus [min|stop], hello, working, tool, done, attention, end, idle, sleep, bright 0-255
+.venv/bin/pio device monitor -b 115200            # seriell: ping, demo, stats, dbg, sessions, focus [min|stop], swipe, tap [l|r], hello, working, tool, done, attention, end, idle, sleep, bright 0-255
 ```
 
 ## Original wiederherstellen

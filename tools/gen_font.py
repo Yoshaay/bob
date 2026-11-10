@@ -2,13 +2,13 @@
 """Render anti-aliased bitmap fonts (4-bit alpha) for Bob's firmware.
 
 Usage: gen_font.py <font.ttf> <out.h>
-Generates FONT_SMALL covering ASCII + German umlauts.
+Generates FONT_SMALL and FONT_BIG covering ASCII + German umlauts.
 """
 import sys
 from PIL import Image, ImageDraw, ImageFont
 
 CHARS = [chr(c) for c in range(32, 127)] + list("äöüÄÖÜß")
-SIZES = [("FONT_SMALL", 22, 700)]
+SIZES = [("FONT_SMALL", 22, 700), ("FONT_BIG", 40, 800)]
 
 
 def render(ttf, name, px, weight):
